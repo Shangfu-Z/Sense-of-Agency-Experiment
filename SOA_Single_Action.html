@@ -1,0 +1,553 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <title>Move The Dot Toward The Box</title>
+  <h2>Using Keyboard</h2>
+  <style>
+    body { font-family: Arial, sans-serif; display:flex; flex-direction:column; align-items:center; gap:12px; padding:20px; }
+    #figure { border:1px solid #888; width:640px; padding:8px; display:flex; justify-content:center; }
+    #canvasContainer { background:#f7f7f7; padding:6px; }
+    canvas { background: #fff; display:block; }
+    #status { min-height:24px; }
+    #ratingOverlay {
+      position:fixed; left:0; top:0; width:100%; height:100%; display:flex;
+      align-items:center; justify-content:center; background: rgba(0,0,0,0.35);
+      visibility:hidden;
+    }
+    #ratingBox {
+      background:white; padding:20px; border-radius:8px; min-width:420px; text-align:center;
+      box-shadow: 0 6px 18px rgba(0,0,0,0.25);
+    }
+    #sliderBar { margin-top:10px; display:flex; align-items:center; gap:12px; }
+    #sliderTrack {
+      height:12px; background:#ddd; flex:1; position:relative; border-radius:6px;
+    }
+    #sliderKnob {
+      width:18px; height:18px; border-radius:50%; background:#333; position:absolute; top:50%;
+      transform:translate(-50%,-50%);
+    }
+    #instructions { font-size:13px; color:#444; }
+    button { padding:6px 12px; }
+  </style>
+</head>
+<body>
+  <h2>Move The Dot Toward The Box</h2>
+  <div id="figure">
+    <div id="canvasContainer">
+      <!-- Canvas uses 600x400 box (pixels) but drawing uses normalized coords [0,1] -->
+      <canvas id="expCanvas" width="600" height="400"></canvas>
+    </div>
+  </div>
+
+  <div id="status">Press any arrow key to start the first trial when the green square appears.</div>
+  <div id="logPreview"></div>
+
+  <!-- Rating overlay -->
+  <div id="ratingOverlay">
+    <div id="ratingBox">
+      <div id="ratingPrompt">To what extent did you feel in control during past 10 trials?<br>Press SPACE to confirm your response.</div>
+      <div id="sliderBar">
+        <div id="sliderTrack">
+          <div id="sliderKnob"></div>
+        </div>
+        <div id="sliderValue">You entered: 0.0</div>
+      </div>
+      <div style="margin-top:12px;">
+        <div id="instructions">Use LEFT/RIGHT arrow keys to change slider by 0.1. Press SPACE to confirm.</div>
+      </div>
+    </div>
+  </div>
+
+<script>
+/*
+  experiment.html
+  - Subject ID: last 5 digits of Date.now()
+  - RNG seeded from subject_id (integer)
+  - Normalized coordinate system used for canvas drawing (coords in [0,1] scaled to 600x400)
+  - Logging: sends POST to SHEET_ENDPOINT (must accept JSON payload with row fields)
+*/
+
+(() => {
+  // ---------- CONFIG ----------
+  const BOX_W = 600, BOX_H = 400;          // pixel size of the box
+  const DOT_RADIUS_NORM = 0.02;            // normalized (0..1)
+  const SQUARE_SIZE_NORM = 0.06;           // normalized
+  const ANIMATION_DURATION = 400;          // ms for dot travel
+  const BLOCKS = 30;
+  const TRIALS_PER_BLOCK = 10;
+  const Error_trial = Array.from({length:10}, (_,i)=>i); // [0..9]
+
+  // Provide your Google Apps Script / endpoint URL here. If empty, logging will be only to console.
+  const SHEET_ENDPOINT = 'https://script.google.com/macros/s/AKfycbykXdieAsk-sRaG9k3KqBtsmRH6tOr5maB6s_HQj37IJXhLkCx9WiLNeVSo1b7zQ9aUCQ/exec'; 
+  // e.g. 'https://script.google.com/macros/s/....../exec'
+
+  // ---------- SUBJECT / RNG ----------
+  const now = Date.now().toString();
+  const subject_id = now.slice(-5);
+  // Seeded RNG: mulberry32
+  function mulberry32(a) {
+    return function() {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      let t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    }
+  }
+  const seedInt = parseInt(subject_id,10) || 1;
+  const rnd = mulberry32(seedInt);
+
+  // helper: random int in [min, max] inclusive
+  function rInt(min, max) { return Math.floor(rnd()*(max-min+1))+min; }
+
+  // ---------- Canvas + Normalized coordinate helpers ----------
+  const canvas = document.getElementById('expCanvas');
+  const ctx = canvas.getContext('2d');
+  canvas.width = BOX_W; canvas.height = BOX_H;
+
+  function toPixelX(nx){ return nx * BOX_W; }
+  function toPixelY(ny){ return ny * BOX_H; }
+  function clearCanvas(){ ctx.clearRect(0,0,BOX_W,BOX_H); }
+
+  // ---------- UI elements ----------
+  const status = document.getElementById('status');
+  const logPreview = document.getElementById('logPreview');
+  const ratingOverlay = document.getElementById('ratingOverlay');
+  const sliderTrack = document.getElementById('sliderTrack');
+  const sliderKnob = document.getElementById('sliderKnob');
+  const sliderValue = document.getElementById('sliderValue');
+
+  // ---------- Experiment state ----------
+  let blockIndex = 0; // 0..9
+  let trialIndex = 0; // 0..9 within block
+  let currentBlockErrorCount = 0; // how many error trials in this block
+  let errorTrialPositions = []; // indices within block marked as error trials
+  let trialInProgress = false;
+  let dotPos = {x:0.5, y:0.5}; // normalized
+  let greenDirection = null; // 'up'|'down'|'left'|'right'
+  let keyPressCount = 0;
+  let expectedDirection = null;
+  let awaitingKey = false;
+  let trialStartTime = 0; // will hold trial onset time
+  let pendingTenthTrial = null; // buffer for 10th trial until rating is collected
+
+
+  // Logging buffer for preview
+  let logs = [];
+
+  // ---------- Set up blocks: uses Error_trial values in order (0..9) ----------
+  // First 10 blocks: 0..9
+const firstTen = Array.from({length:10}, (_,i)=>i);
+
+// Next 10 blocks: 9..1
+const nextTen = Array.from({length:10}, (_,i)=>9 - i); // [9..1]
+
+// Last 10 blocks: random permutation of 0..9 using seeded RNG
+function shuffleArray(arr, rndFn) {
+  const a = arr.slice();
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = Math.floor(rndFn() * (i + 1));
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+  return a;
+}
+const lastTen = shuffleArray(Array.from({length:10}, (_,i)=>i), rnd);
+
+// Concatenate to form 30 blocks
+
+
+let blocksErrorValues;
+
+if (subject_id % 2 === 1) {
+  // odd ID → original order
+  blocksErrorValues = [...firstTen, ...nextTen, ...lastTen];
+} else {
+  // even ID → swapped first two sections
+  blocksErrorValues = [...nextTen, ...firstTen, ...lastTen];
+}
+// const blocksErrorValues = Error_trial.slice(0, BLOCKS); // 10 blocks with 0..9
+
+  // ---------- Utility: beep ----------
+  function beep(duration=120, freq=800, volume=0.05) {
+    try {
+      const ctx = new (window.AudioContext || window.webkitAudioContext)();
+      const o = ctx.createOscillator();
+      const g = ctx.createGain();
+      o.connect(g); g.connect(ctx.destination);
+      g.gain.value = volume;
+      o.type = 'sine';
+      o.frequency.value = freq;
+      o.start(0);
+      setTimeout(()=> {
+        o.stop();
+        ctx.close();
+      }, duration);
+    } catch(e){ /* ignore if not supported */ }
+  }
+
+  // ---------- Helper: pick green square position (cardinal) ----------
+  function pickDirection() {
+    const idx = rInt(0,3);
+    return ['up','down','left','right'][idx];
+  }
+
+  function directionToPosition(dir) {
+    const center = {x:0.5,y:0.5};
+    const margin = 0.3; // normalized distance from center to near edge
+    if(dir === 'up') return {x:center.x, y: center.y - margin};
+    if(dir === 'down') return {x:center.x, y: center.y + margin};
+    if(dir === 'left') return {x:center.x - margin, y: center.y};
+    if(dir === 'right') return {x:center.x + margin, y: center.y};
+    return center;
+  }
+
+  // ---------- Draw helpers ----------
+  function drawDot(nx, ny) {
+    const px = toPixelX(nx), py = toPixelY(ny);
+    ctx.beginPath();
+    ctx.fillStyle = 'black';
+    ctx.arc(px, py, DOT_RADIUS_NORM * BOX_W, 0, Math.PI*2);
+    ctx.fill();
+  }
+  function drawGreenSquare(dir) {
+    const pos = directionToPosition(dir);
+    const sizePx = SQUARE_SIZE_NORM * BOX_W;
+    const px = toPixelX(pos.x) - sizePx/2;
+    const py = toPixelY(pos.y) - (SQUARE_SIZE_NORM*BOX_H)/2;
+    ctx.fillStyle = 'green';
+    ctx.fillRect(px, py, sizePx, SQUARE_SIZE_NORM * BOX_H);
+  }
+  function renderScene(dotX, dotY, greenDir) {
+    clearCanvas();
+    // draw normalized axes boundary (optional) - we keep box white with subtle border
+    ctx.strokeStyle = '#aaa';
+    ctx.lineWidth = 1;
+    ctx.strokeRect(0.5, 0.5, BOX_W-1, BOX_H-1); // small border
+    if(greenDir) drawGreenSquare(greenDir);
+    drawDot(dotX, dotY);
+  }
+
+  // ---------- Animation: move dot from current to target over duration ----------
+  function animateDotTo(targetNx, targetNy, durationMs, onComplete) {
+    const startX = dotPos.x, startY = dotPos.y;
+    const t0 = performance.now();
+    function step(now) {
+      const t = Math.min(1, (now - t0) / durationMs);
+      const ease = t<0.5 ? 2*t*t : -1 + (4-2*t)*t; // smooth ease
+      dotPos.x = startX + (targetNx - startX)*ease;
+      dotPos.y = startY + (targetNy - startY)*ease;
+      renderScene(dotPos.x, dotPos.y, greenDirection);
+      if(t < 1) requestAnimationFrame(step);
+      else {
+        // ensure final
+        dotPos.x = targetNx; dotPos.y = targetNy;
+        renderScene(dotPos.x, dotPos.y, greenDirection);
+        if(onComplete) onComplete();
+      }
+    }
+    requestAnimationFrame(step);
+  }
+
+  // ---------- Logging to Google Sheets (or console if no endpoint) ----------
+  async function logToServer(row) {
+    // row: object with fields subject_id, block, trial, expected_direction, response_key, error_occurred, key_presses, rating
+    logs.push(row);
+    // update preview in UI
+    //logPreview.innerText = 'Last row: ' + JSON.stringify(row);
+    
+    if(!SHEET_ENDPOINT) {
+      console.log('LOG (console):', row);
+      return {ok:true};
+    }
+    try {
+      const resp = await fetch(SHEET_ENDPOINT, {
+        method: 'POST',
+        mode: 'no-cors',  
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify(row)
+      });
+      return resp;
+    } catch(err) {
+      console.error('Logging failed', err);
+      return {ok:false, err};
+    }
+  }
+
+  // ---------- Trial flow ----------
+  function startBlock(bidx) {
+    blockIndex = bidx;
+    trialIndex = 0;
+    currentBlockErrorCount = blocksErrorValues[bidx];
+    // pick positions for error trials inside block: choose currentBlockErrorCount unique indices from 0..9
+    errorTrialPositions = [];
+    // Use RNG to pick unique indices
+    const allIdx = Array.from({length:TRIALS_PER_BLOCK}, (_,i)=>i);
+    for(let k=0;k<currentBlockErrorCount;k++){
+      const i = rInt(0, allIdx.length-1);
+      errorTrialPositions.push(allIdx.splice(i,1)[0]);
+    }
+    // status.innerText = `Block ${bidx+1}/${BLOCKS}. Error trials in this block: ${currentBlockErrorCount}. Starting...`;
+    status.innerText = `Let's Go!!!`;
+    setTimeout(()=> startTrial(), 400);
+  }
+
+  function startTrial() {
+    trialStartTime = performance.now();
+    trialInProgress = true;
+    keyPressCount = 0;
+    dotPos = {x:0.5, y:0.5}; // center
+    // choose green direction
+    greenDirection = pickDirection();
+    expectedDirection = greenDirection;
+    renderScene(dotPos.x, dotPos.y, greenDirection);
+    awaitingKey = true;
+    status.innerText = `Block ${blockIndex+1}, Trial ${trialIndex+1}: Press the arrow key toward the green square.`;
+  }
+
+  function endTrial(data) {
+    // data: {expected_direction, response_key, error_occurred, key_presses, rating}
+    // rating only non-zero at end-of-block (trialIndex was 0..9; rating provided when trialIndex==9)
+    const rt = performance.now() - trialStartTime;
+    const row = {
+      subject_id,
+      block: blockIndex+1,
+      trial: trialIndex+1,
+      expected_direction: data.expected_direction,
+      response_key: data.response_key,
+      error_occurred: data.error_occurred,
+      key_presses: data.key_presses,
+      rating: data.rating || 0,
+      rating_initial: 0,
+      block_error_value: blocksErrorValues[blockIndex],
+      reaction_time: rt.toFixed(2) // keep 2 decimals (ms)
+    };
+    if (trialIndex === TRIALS_PER_BLOCK - 1) {
+    // 10th trial → wait for rating
+      pendingTenthTrial = row;
+    } else {
+      // trials 1–9 → log immediately
+      logToServer(row).then(()=>{});
+    }
+    // move to next trial or rating if block finished
+    trialInProgress = false;
+    awaitingKey = false;
+    greenDirection = null;
+    renderScene(dotPos.x, dotPos.y, null); // clear green square
+    // increment trial
+    trialIndex++;
+    if(trialIndex >= TRIALS_PER_BLOCK) {
+      // show rating overlay
+      showRatingOverlay().then(({ rating_final, rating_initial }) => {
+        // record rating (final trial's rating)
+        // The instruction said "rating(only at every 10 trial, for trial 1-9, just record 0)"
+        // We've already logged trials 1..10; but rating should be recorded for the 10th trial's log.
+        // To follow that, we will send an extra row marking rating? Simpler: modify last logged row (trial 10) to include rating.
+        if (pendingTenthTrial) {
+          pendingTenthTrial.rating = rating_final;
+          pendingTenthTrial.rating_initial = rating_initial; // ✅ NEW
+          logToServer(pendingTenthTrial).then(() => {});
+          pendingTenthTrial = null;
+        }
+        // go to next block or finish
+        if(blockIndex+1 < BLOCKS) {
+          startBlock(blockIndex+1);
+        } else {
+          const confirmationNumber = Number(subject_id) + 7;
+
+          status.innerHTML = `
+            Experiment finished. Thank you!<br><br>
+            <strong>Your confirmation number is ${confirmationNumber}</strong>
+          `;
+
+          alert(
+            `Experiment finished. Thank you!\n\n` +
+            `Your confirmation number is ${confirmationNumber}`
+          );
+        }
+      });
+    } else {
+      // short delay then start next trial
+      setTimeout(()=> startTrial(), 400);
+    }
+  }
+
+  function flashColor(color, duration = 150) {
+    ctx.save();
+    ctx.fillStyle = color;
+    ctx.globalAlpha = 0.35;
+    ctx.fillRect(0,0,BOX_W,BOX_H);
+    ctx.restore();
+    setTimeout(() => renderScene(dotPos.x, dotPos.y, null), duration);
+  }
+
+  // ---------- Key handling ----------
+  // Map keys to directions
+  function keyToDir(key) {
+    if(key === 'ArrowUp') return 'up';
+    if(key === 'ArrowDown') return 'down';
+    if(key === 'ArrowLeft') return 'left';
+    if(key === 'ArrowRight') return 'right';
+    return null;
+  }
+
+  window.addEventListener('keydown', (ev) => {
+    // If rating overlay visible, it captures keys (slider)
+    if(ratingOverlay.style.visibility === 'visible') {
+      // rating handled separately
+      ev.preventDefault();
+      return;
+    }
+    if(!trialInProgress || !awaitingKey) return;
+    const dir = keyToDir(ev.key);
+    if(!dir) return;
+    ev.preventDefault();
+    keyPressCount++;
+    // If direction doesn't match, beep and wait
+    if(dir !== expectedDirection) {
+      beep(100, 600);
+      status.innerText = `Wrong direction. Try again. Key presses: ${keyPressCount}`;
+      return;
+    }
+    // direction matches expected
+    // Determine if this is an "error trial" (i.e., cause dot to move opposite direction)
+
+    awaitingKey = false; 
+
+    const isErrorTrial = errorTrialPositions.includes(trialIndex);
+    if(isErrorTrial) {
+      // move dot to opposite direction
+      const opposite = {up:'down', down:'up', left:'right', right:'left'}[dir];
+      const target = directionToPosition(opposite);
+      // animate and then immediately end trial after animation
+      animateDotTo(target.x, target.y, ANIMATION_DURATION, () => {
+        // clear page (we interpret "clear page" as clearing canvas) then move to next trial
+        flashColor('red');   // "red" add this line
+        setTimeout(() => {
+          endTrial({
+            expected_direction: expectedDirection,
+            response_key: dir,
+            error_occurred: true,
+            key_presses: keyPressCount,
+            rating: 0
+          });
+        }, 150);
+      });
+    } else {
+      // normal trial: move dot to the green square (correct)
+      const target = directionToPosition(dir);
+      animateDotTo(target.x, target.y, ANIMATION_DURATION, () => {
+        // trial ends successfully
+        flashColor('green');   // green add this line
+        setTimeout(() => {
+          endTrial({
+            expected_direction: expectedDirection,
+            response_key: dir,
+            error_occurred: false,
+            key_presses: keyPressCount,
+            rating: 0
+          });
+        }, 150);
+      });
+    }
+  });
+
+  // ---------- Rating overlay logic ----------
+  function showRatingOverlay() {
+    return new Promise((resolve) => {
+      const possible = Array.from({length:9}, (_,i)=> (i+1)/10 ); 
+      // [0.1, 0.2, ..., 0.9]
+
+      const startIdx = rInt(0, possible.length - 1);
+      let currentValue = possible[startIdx];
+      const initialValue = currentValue; 
+
+      function updateKnob() {
+        const px = currentValue * 100;
+        // position knob within sliderTrack width
+        const trackW = sliderTrack.clientWidth;
+        const knobX = currentValue * trackW;
+        sliderKnob.style.left = `${knobX}px`;
+        sliderValue.innerText = `You entered: ${currentValue.toFixed(1)}`;
+      }
+
+      function onKey(ev) {
+        if(ev.key === 'ArrowLeft') {
+          ev.preventDefault();
+          currentValue = Math.max(0, +(currentValue - 0.1).toFixed(1));
+          updateKnob();
+        } else if(ev.key === 'ArrowRight') {
+          ev.preventDefault();
+          currentValue = Math.min(1, +(currentValue + 0.1).toFixed(1));
+          updateKnob();
+        } else if(ev.key === ' ' || ev.code === 'Space') {
+          ev.preventDefault();
+          // confirm
+          cleanup();
+          resolve({
+            rating_final: currentValue,
+            rating_initial: initialValue
+          });
+        }
+      }
+
+      function cleanup() {
+        ratingOverlay.style.visibility = 'hidden';
+        window.removeEventListener('keydown', onKey);
+      }
+
+      // show overlay
+      ratingOverlay.style.visibility = 'visible';
+      // position knob immediately after overlay is rendered
+      setTimeout(()=> {
+        updateKnob();
+      }, 0);
+      window.addEventListener('keydown', onKey);
+    });
+  }
+
+  // ---------- Initialization ----------
+  // initial render: center dot, empty
+  renderScene(dotPos.x, dotPos.y, null);
+  status.innerText = `Subject ID: ${subject_id}. Press any arrow key when ready.`;
+
+  // Start first block automatically after user presses any arrow to begin first trial.
+  // We'll attach a one-time listener to start the experiment.
+  function startOnAnyArrowOnce(ev) {
+    if(['ArrowUp','ArrowDown','ArrowLeft','ArrowRight'].includes(ev.key)) {
+      window.removeEventListener('keydown', startOnAnyArrowOnce);
+      // start experiment
+      startBlock(0);
+    }
+  }
+  window.addEventListener('keydown', startOnAnyArrowOnce);
+
+  // Expose some debug controls for local testing (not required)
+  window.__exp_debug = {
+    subject_id, seedInt, logs
+  };
+
+  // Provide instructions for Apps Script endpoint in console (if endpoint is empty)
+  if(!SHEET_ENDPOINT) {
+    console.log('No SHEET_ENDPOINT configured. Logging will be printed to console only.');
+    console.log('To enable Google Sheets logging, deploy an Apps Script web app that accepts POST JSON and appends rows to a sheet.');
+    console.log('Example Apps Script (Google Sheets) skeleton:');
+    console.log(`/*
+// Apps Script code (paste into script.google.com and deploy as web app)
+function doPost(e) {
+  var ss = SpreadsheetApp.openById('YOUR_SPREADSHEET_ID');
+  var sheet = ss.getSheetByName('Sheet1');
+  var payload = JSON.parse(e.postData.contents);
+  // expected payload fields: subject_id, block, trial, expected_direction, response_key, error_occurred, key_presses, rating
+  sheet.appendRow([new Date(), payload.subject_id, payload.block, payload.trial, payload.expected_direction, payload.response_key, payload.error_occurred, payload.key_presses, payload.rating || 0]);
+  // if payload.update==true you may implement an update logic instead of append
+  return ContentService.createTextOutput(JSON.stringify({status:'ok'})).setMimeType(ContentService.MimeType.JSON);
+}
+*/`);
+  } else {
+    console.log('Logging endpoint set to:', SHEET_ENDPOINT);
+  }
+
+})();
+</script>
+</body>
+</html>
